@@ -1,0 +1,6 @@
+elasticsearch==8.14.0
+pandas
+websockets
+pyais
+python-dotenv
+requests

@@ -1,0 +1,5 @@
+/es_data/
+/.venv/
+/__pycache__/
+.env
+20251110.gkg.csv
