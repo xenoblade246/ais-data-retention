@@ -1,18 +1,57 @@
-# gkg_uploader.py
-
 import os
 import pandas as pd
 import numpy as np
-from datetime import datetime
-import csv
+from datetime import datetime, timezone
 import json
 from dotenv import load_dotenv
+from elasticsearch import Elasticsearch
+import time as tm
+from typing import Optional
+import csv
 
-# Import from your existing aisUtil module
-from aisUtil import (
-    connect_to_es,
-    wait_for_elasticsearch
-)
+################################################ Functions ################################################
+def connect_to_es(user, password) -> Elasticsearch:
+    """
+    Establish a connection to the Elasticsearch cluster with timeout and retry logic.
+
+    Returns:
+        Elasticsearch: The connected Elasticsearch client.
+    """
+    return Elasticsearch(
+        ["http://localhost:9200"],
+        http_auth=(user, password),
+        request_timeout=30,
+        max_retries=5,
+        retry_on_timeout=True
+    )
+
+def wait_for_elasticsearch(user: str, password: str, max_retries: int=30, delay: int=5):
+    """
+    Wait for Elasticsearch to be available before proceeding.
+
+    Returns:
+        bool: A boolean representing the success status of Elasticsearch.
+    """
+    for attempt in range(max_retries):
+        try:
+            es = Elasticsearch(
+                ["http://localhost:9200"],
+                basic_auth=(user, password),
+                request_timeout=10
+            )
+            # Test connection
+            es.info()
+            print(f"Successfully connected to Elasticsearch on attempt {attempt + 1}")
+            return True
+        except Exception as e:
+            print(f"Attempt {attempt + 1}: Elasticsearch not ready yet - {e}")
+            if attempt < max_retries - 1:
+                print(f"Waiting {delay} seconds before retry...")
+                tm.sleep(delay)
+            else:
+                print("Max retries reached. Elasticsearch may not be available.")
+                return False
+    return False
 
 def read_json(name: str) -> dict:
     """
@@ -25,7 +64,29 @@ def read_json(name: str) -> dict:
         out = json.load(f)
     return out
 
-def ingestpastdata(user: Optional[str], password: Optional[str], indexname: str, mappings: dict, countrycodeDict: dict, file: str) -> None:
+def ingestpastdata(user: Optional[str], password: Optional[str], indexname: str, mappings: dict, file: str):
+    """
+    Ingests data from a CSV file into an Elasticsearch index.
+
+    This function performs an ETL (Extract, Transform, Load) process:
+    1. Connects to the Elasticsearch instance.
+    2. Creates the specified index with provided mappings if it doesn't exist.
+    3. Processes the CSV file to ensure specific column ordering and handles missing values.
+    4. Transforms Unix epoch timestamps into ISO 8601 UTC strings.
+    5. Formats latitude and longitude into a 'Location' list for geo-spatial indexing.
+    6. Loads the data row-by-row into the database.
+
+    Args:
+        user (Optional[str]): Username for Elasticsearch authentication.
+        password (Optional[str]): Password for Elasticsearch authentication.
+        indexname (str): The name of the target index in Elasticsearch.
+        mappings (dict): A dictionary defining the Elasticsearch index settings and schema.
+        countrycodeDict (dict): A dictionary used to look up country names via MMSI prefixes.
+        file (str): The file path to the source CSV data.
+
+    Raises:
+        Exception: If a connection error occurs or if document indexing fails.
+    """
     try:
         # Connect to Elastic Search DB
         es = connect_to_es(user, password)
@@ -65,67 +126,28 @@ def ingestpastdata(user: Optional[str], password: Optional[str], indexname: str,
         # Account for missing values
         df = df.fillna("")
         df_dict = df.to_dict("records")
+
         # Iterate through each row of the dictionary
         for i in range(len(df_dict)):
-
             report = {}
-            location = [
-                str(df_dict[i]["Lat"]) + "," + str(df_dict[i]["Lon"])
-            ]
-            country = countrycodeDict.get(str(df_dict[i]["MMSI"])[:3], [None, None])[0]
+            location = [str(df_dict[i]["Lat"]) + "," + str(df_dict[i]["Lon"])]
+
             # Assign Key value pairs
-            (
-                report["Lat"],
-                report["Lon"],
-                report["MMSI"],
-                report["Name"],
-                report["Location"],
-                report["Time"],
-                report["Country"],
-                report["Source"],
-                report["Subsource"],
-                report["Speed"],
-                report["Course"],
-            ) = (
-                df_dict[i]["Lat"],
-                df_dict[i]["Lon"],
-                df_dict[i]["MMSI"],
-                df_dict[i]["Name"],
-                location,
-                df_dict[i]["Time"],
-                df_dict[i]["Country"],
-                df_dict[i]["Source"],
-                df_dict[i]["Subsource"],
-                df_dict[i]["Speed"],
-                df_dict[i]["Course"],
-            )
+            for key in expectedCol:
+                report[key] = df_dict[i][key]
+            report["Location"] = location
             doc = json.dumps(report)
+
+            # Feeds into Elasticsearch
             try:
                 es.index(index=indexname, body=doc) #type: ignore
-                print(doc)
             except Exception as e:
                 raise Exception(e)
 
-        messagebox.showinfo("Success", "Data ingestion completed successfully.")
-    except Exception as e:
-        messagebox.showerror("Error", f"An unexpected error occurred: {str(e)}")
+        print("Success", "Data ingestion completed successfully.")
 
-def setup_environment():
-    """Load environment variables"""
-    load_dotenv()
-    
-    user = os.getenv("ESUSER")
-    password = os.getenv("ESPASSWORD")
-    
-    if not user or not password:
-        print("❌ Error: ESUSER and/or ESPASSWORD not found in environment variables")
-        print("Please create a .env file with:")
-        print("ESUSER=your_username")
-        print("ESPASSWORD=your_password")
-        return None, None
-    
-    print(f"✅ Loaded credentials for user: {user}")
-    return user, password
+    except Exception as e:
+        print("Error", f"An unexpected error occurred: {str(e)}")
 
 def parse_gkg_columns():
     """Return the column definitions for GKG 2.0 format"""
@@ -465,12 +487,12 @@ def upload_gkg_to_elasticsearch(user, password, gkg_file_path, index_name="gkg_d
         sample_size: Number of rows to sample (for testing)
         clean_data: Whether to clean data before upload
     """
-    print(f"\n🚀 Starting GKG upload process")
+    print("\n🚀 Starting GKG upload process")
     print(f"   File: {gkg_file_path}")
     print(f"   Index: {index_name}")
     
     # Step 1: Load GKG data
-    df_raw = gkg_to_dataframe(gkg_file_path, sample_size)
+    df_raw = gkg_to_dataframe(gkg_file_path, sample_size) # type: ignore
     if df_raw is None:
         return False
     
@@ -491,7 +513,7 @@ def upload_gkg_to_elasticsearch(user, password, gkg_file_path, index_name="gkg_d
         
         # Create index with GKG-specific mapping
         gkg_mapping = create_es_mapping_for_gkg()
-        es.indices.create(index=index_name, body=gkg_mapping, ignore=400)
+        es.indices.create(index=index_name, body=gkg_mapping, ignore=400) # type: ignore
         print(f"✅ Created/verified index: {index_name}")
         
         # Step 5: Upload using existing ingest function
@@ -501,7 +523,6 @@ def upload_gkg_to_elasticsearch(user, password, gkg_file_path, index_name="gkg_d
             password=password,
             indexname=index_name,
             mappings=gkg_mapping,
-            countrycodeDict={},  # Not using country codes for GKG
             file=csv_path
         )
         
@@ -522,181 +543,15 @@ def upload_gkg_to_elasticsearch(user, password, gkg_file_path, index_name="gkg_d
         traceback.print_exc()
         return False
 
-def gkg_explorer(gkg_file_path, num_rows=5):
-    """Explore GKG file structure and content"""
-    print(f"\n🔍 Exploring GKG file: {gkg_file_path}")
-    
-    df = gkg_to_dataframe(gkg_file_path, sample_size=num_rows)
-    if df is None:
-        return
-    
-    print(f"\n📋 Sample data (first {num_rows} rows):")
-    print("-" * 80)
-    
-    # Display key columns
-    display_cols = ['GKGRECORDID', 'DATE', 'SOURCECOMMONNAME', 'NUM_THEMES', 'NUM_LOCATIONS']
-    display_cols = [col for col in display_cols if col in df.columns]
-    
-    print(df[display_cols].head(num_rows).to_string())
-    
-    # Show column statistics
-    print(f"\n📊 Column statistics:")
-    print("-" * 80)
-    for col in df.columns:
-        non_null = df[col].notna().sum()
-        null = df[col].isna().sum()
-        unique = df[col].nunique()
-        print(f"{col:30s} | Non-null: {non_null:6d} | Null: {null:6d} | Unique: {unique:6d}")
-    
-    # Show THEMES examples
-    if 'THEMES' in df.columns:
-        print(f"\n🎯 Sample themes:")
-        themes_sample = df['THEMES'].dropna().head(3).tolist()
-        for i, themes in enumerate(themes_sample[:3]):
-            print(f"  {i+1}. {themes[:100]}...")
-    
-    # Show LOCATIONS examples
-    if 'LOCATIONS' in df.columns:
-        print(f"\n📍 Sample locations:")
-        locs_sample = df['LOCATIONS'].dropna().head(3).tolist()
-        for i, locs in enumerate(locs_sample[:3]):
-            print(f"  {i+1}. {locs[:100]}...")
-
-def main():
-    """Main menu for GKG uploader"""
-    print("\n" + "="*60)
-    print("GKG (Global Knowledge Graph) UPLOADER TO ELASTICSEARCH")
-    print("="*60)
-    
-    # Setup environment
-    user, password = setup_environment()
-    if not user or not password:
-        return
-    
-    while True:
-        print("\n" + "="*60)
-        print("GKG UPLOADER MENU")
-        print("="*60)
-        print("1. Explore GKG file structure")
-        print("2. Upload GKG file to Elasticsearch")
-        print("3. Convert GKG to CSV (without upload)")
-        print("4. Clean and preview GKG data")
-        print("5. Exit")
-        print("="*60)
-        
-        choice = input("\nEnter your choice (1-5): ").strip()
-        
-        if choice == '1':
-            gkg_file = input("Enter GKG file path: ").strip()
-            if os.path.exists(gkg_file):
-                sample_size = input("Number of rows to sample (default 5): ").strip()
-                sample_size = int(sample_size) if sample_size.isdigit() else 5
-                gkg_explorer(gkg_file, sample_size)
-            else:
-                print(f"❌ File not found: {gkg_file}")
-        
-        elif choice == '2':
-            gkg_file = input("Enter GKG file path: ").strip()
-            if os.path.exists(gkg_file):
-                index_name = input("Enter index name (default: gkg_data): ").strip()
-                if not index_name:
-                    index_name = "gkg_data"
-                
-                sample_option = input("Sample data? (y/n, default n): ").strip().lower()
-                if sample_option == 'y':
-                    sample_size = input("Number of rows to upload: ").strip()
-                    sample_size = int(sample_size) if sample_size.isdigit() else 1000
-                else:
-                    sample_size = None
-                
-                clean_option = input("Clean data before upload? (y/n, default y): ").strip().lower()
-                clean_data = clean_option != 'n'
-                
-                upload_gkg_to_elasticsearch(
-                    user=user,
-                    password=password,
-                    gkg_file_path=gkg_file,
-                    index_name=index_name,
-                    sample_size=sample_size,
-                    clean_data=clean_data
-                )
-            else:
-                print(f"❌ File not found: {gkg_file}")
-        
-        elif choice == '3':
-            gkg_file = input("Enter GKG file path: ").strip()
-            if os.path.exists(gkg_file):
-                output_csv = input("Enter output CSV path (default: gkg_output.csv): ").strip()
-                if not output_csv:
-                    output_csv = "gkg_output.csv"
-                
-                sample_size = input("Number of rows to convert (default all): ").strip()
-                sample_size = int(sample_size) if sample_size.isdigit() else None
-                
-                df = gkg_to_dataframe(gkg_file, sample_size)
-                if df is not None:
-                    df_clean = clean_gkg_data(df)
-                    convert_to_csv_for_es(df_clean, output_csv)
-            else:
-                print(f"❌ File not found: {gkg_file}")
-        
-        elif choice == '4':
-            gkg_file = input("Enter GKG file path: ").strip()
-            if os.path.exists(gkg_file):
-                sample_size = input("Number of rows to preview (default 100): ").strip()
-                sample_size = int(sample_size) if sample_size.isdigit() else 100
-                
-                df_raw = gkg_to_dataframe(gkg_file, sample_size)
-                if df_raw is not None:
-                    df_clean = clean_gkg_data(df_raw)
-                    
-                    print(f"\n🧹 Cleaning statistics:")
-                    print(f"   Original rows: {len(df_raw)}")
-                    print(f"   Cleaned rows: {len(df_clean)}")
-                    print(f"   New columns added: {len(df_clean.columns) - len(df_raw.columns)}")
-                    
-                    print(f"\n📊 First few rows of cleaned data:")
-                    print(df_clean.head(3).to_string())
-            else:
-                print(f"❌ File not found: {gkg_file}")
-        
-        elif choice == '5':
-            print("\n👋 Exiting GKG Uploader. Goodbye!")
-            break
-        
-        else:
-            print("❌ Invalid choice. Please try again.")
-        
-        input("\nPress Enter to continue...")
-
 if __name__ == "__main__":
     mappings = read_json("mappings.json")
     countrycode_dict = read_json("country_code.json")
-    # Command line support
-    import sys
-    
-    if len(sys.argv) > 1:
-        # Quick upload from command line
-        if sys.argv[1] == "upload" and len(sys.argv) >= 3:
-            gkg_file = sys.argv[2]
-            index_name = sys.argv[3] if len(sys.argv) >= 4 else "gkg_data"
-            
-            user, password = setup_environment()
-            if user and password:
-                upload_gkg_to_elasticsearch(
-                    user=user,
-                    password=password,
-                    gkg_file_path=gkg_file,
-                    index_name=index_name
-                )
-        elif sys.argv[1] == "explore" and len(sys.argv) >= 3:
-            gkg_file = sys.argv[2]
-            sample_size = int(sys.argv[3]) if len(sys.argv) >= 4 else 5
-            gkg_explorer(gkg_file, sample_size)
-        else:
-            print("Usage:")
-            print("  python gkg_uploader.py upload <gkg_file> [index_name]")
-            print("  python gkg_uploader.py explore <gkg_file> [sample_size]")
-    else:
-        # Interactive mode
-        main()
+    load_dotenv()
+    user = os.getenv("ESUSER")
+    password = os.getenv("ESPASSWORD")
+    upload_gkg_to_elasticsearch(
+        user=user,
+        password=password,
+        gkg_file_path="C:\\Users\\ngyee\\Coding\\OTB\\AIS Data Retention\\20251110.gkg.csv",
+        index_name="gkg_data"
+    )
