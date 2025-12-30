@@ -1,10 +1,14 @@
-import os
+from urllib.parse import urlparse
 import pandas as pd
+from elasticsearch.helpers import bulk
+import os
 import json
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
 import time as tm
-from urllib.parse import urlparse
+
+################################################ Constants ################################################
+GKG_COLUMNS = ["DATE", "NUMARTS", "COUNTS", "THEMES", "LOCATIONS", "PERSONS", "ORGANIZATIONS", "TONE", "CAMEOEVENTIDS", "SOURCES", "SOURCEURLS"]
 
 ################################################ Functions ################################################
 def connect_to_es(user, password) -> Elasticsearch:
@@ -61,40 +65,6 @@ def read_json(name: str) -> dict:
         out = json.load(f)
     return out
 
-def parse_gkg_columns():
-    """Return the column definitions for GKG 2.0 format"""
-    gkg_columns = [
-        "GKGRECORDID",          # Unique identifier
-        "DATE",                 # Date in YYYYMMDD format
-        "SOURCECOLLECTIONIDENTIFIER",  # 1=Web, 2=Citation, 3=Core, 4=DTIC, 5=JSTOR, 6=USGS
-        "SOURCECOMMONNAME",     # Common name of source
-        "DOCUMENTIDENTIFIER",   # URL or identifier
-        # The rest are counts, themes, locations, etc.
-        "COUNTS",               # Counts of events, emotions, etc.
-        "V2COUNTS",             # Enhanced counts
-        "THEMES",               # CAMEO themes
-        "V2THEMES",             # Enhanced themes
-        "LOCATIONS",            # Locations mentioned
-        "V2LOCATIONS",          # Enhanced locations
-        "PERSONS",              # Persons mentioned
-        "V2PERSONS",            # Enhanced persons
-        "ORGANIZATIONS",        # Organizations mentioned
-        "V2ORGANIZATIONS",      # Enhanced organizations
-        "V2TONE",               # Tone analysis
-        "V2ENHANCEDDATES",      # Enhanced dates
-        "V2GCAM",               # Geolocation with CAMEO
-        "V2SHARINGIMAGE",       # Sharing image URLs
-        "V2RELATEDIMAGES",      # Related images
-        "V2SOCIALIMAGEEMBEDS",  # Social image embeds
-        "V2SOCIALVIDEOEMBEDS",  # Social video embeds
-        "V2QUOTATIONS",         # Quotations
-        "V2ALLNAMES",           # All names mentioned
-        "V2AMOUNTS",            # Monetary amounts
-        "V2TRANSLATIONINFO",    # Translation information
-        "V2EXTRASXML"           # Extra XML data
-    ]
-    return gkg_columns
-
 def gkg_to_dataframe(gkg_file_path, sample_size=1000):
     """
     Convert GKG file to pandas DataFrame
@@ -108,7 +78,7 @@ def gkg_to_dataframe(gkg_file_path, sample_size=1000):
     """
     print(f"📖 Reading GKG file: {gkg_file_path}")
     
-    columns = parse_gkg_columns()
+    columns = GKG_COLUMNS
     
     # Read the GKG file
     try:
@@ -134,40 +104,45 @@ def gkg_to_dataframe(gkg_file_path, sample_size=1000):
 
 def clean_gkg_data(df):
     """
-    Clean and preprocess GKG data
-    
-    Args:
-        df: Raw GKG DataFrame
-    
-    Returns:
-        Cleaned DataFrame
+    Clean and preprocess GKG data based on the 11-column format:
+    DATE, NUMARTS, COUNTS, THEMES, LOCATIONS, PERSONS, ORGANIZATIONS, 
+    TONE, CAMEOEVENTIDS, SOURCES, SOURCEURLS
     """
     print("🧹 Cleaning GKG data...")
     
     # Create a copy to avoid modifying original
     df_clean = df.copy()
     
-    # Parse DATE column to datetime
+    # 1. Parse DATE column to datetime
     if 'DATE' in df_clean.columns:
         print("  Parsing dates...")
-        df_clean['DATE'] = pd.to_datetime(df_clean['DATE'], format='%Y%m%d', errors='coerce')
+        # GKG dates are usually YYYYMMDDHHMMSS or YYYYMMDD
+        # We try to handle both; errors='coerce' turns invalid dates to NaT
+        df_clean['DATE'] = pd.to_datetime(df_clean['DATE'].astype(str).str[:8], format='%Y%m%d', errors='coerce')
         df_clean['year'] = df_clean['DATE'].dt.year
         df_clean['month'] = df_clean['DATE'].dt.month
         df_clean['day'] = df_clean['DATE'].dt.day
     
-    # Extract domain from DOCUMENTIDENTIFIER
-    if 'DOCUMENTIDENTIFIER' in df_clean.columns:
-        print("  Extracting domains...")
-        def extract_domain(url):
-            parsed = urlparse(url)
-            domain = parsed.netloc
-            if domain.startswith('www.'):
-                domain = domain[4:]
-            return domain
+    # 2. Extract domain from SOURCEURLS (Replaces DOCUMENTIDENTIFIER)
+    if 'SOURCEURLS' in df_clean.columns:
+        print("  Extracting domains from SOURCEURLS...")
+        def extract_domain(url_str):
+            if pd.isna(url_str):
+                return None
+            # GKG can have multiple URLs separated by semicolon; take the first one
+            primary_url = str(url_str).split(';')[0]
+            try:
+                parsed = urlparse(primary_url)
+                domain = parsed.netloc
+                if domain.startswith('www.'):
+                    domain = domain[4:]
+                return domain
+            except Exception:
+                return None
         
-        df_clean['DOMAIN'] = df_clean['DOCUMENTIDENTIFIER'].apply(extract_domain)
+        df_clean['DOMAIN'] = df_clean['SOURCEURLS'].apply(extract_domain)
     
-    # Parse COUNTS field
+    # 3. Parse COUNTS field
     if 'COUNTS' in df_clean.columns:
         print("  Parsing counts...")
         def parse_counts(count_str):
@@ -180,26 +155,25 @@ def clean_gkg_data(df):
                     if len(parts) >= 3:
                         counts.append({
                             'type': parts[0],
-                            'count': parts[1],
+                            'count': int(parts[1]) if parts[1].isdigit() else 0,
                             'object': parts[2]
                         })
             return counts
         
         df_clean['PARSED_COUNTS'] = df_clean['COUNTS'].apply(parse_counts)
-        df_clean['NUM_COUNTS'] = df_clean['PARSED_COUNTS'].apply(len)
-    
-    # Parse THEMES field
+
+    # 4. Parse THEMES field
     if 'THEMES' in df_clean.columns:
         print("  Parsing themes...")
         def parse_themes(themes_str):
             if pd.isna(themes_str):
                 return []
+            # Returns a list of themes for the PARSED_THEMES keyword field
             return [theme.strip() for theme in str(themes_str).split(';') if theme.strip()]
         
         df_clean['PARSED_THEMES'] = df_clean['THEMES'].apply(parse_themes)
-        df_clean['NUM_THEMES'] = df_clean['PARSED_THEMES'].apply(len)
-    
-    # Parse LOCATIONS field
+
+    # 5. Parse LOCATIONS field
     if 'LOCATIONS' in df_clean.columns:
         print("  Parsing locations...")
         def parse_locations(loc_str):
@@ -215,105 +189,41 @@ def clean_gkg_data(df):
                             'full_name': parts[1],
                             'country_code': parts[2],
                             'adm1': parts[3],
-                            'lat': parts[4],
-                            'lon': parts[5],
+                            'lat': float(parts[4]) if parts[4] else 0.0,
+                            'lon': float(parts[5]) if parts[5] else 0.0,
                             'feature_id': parts[6]
                         })
             return locations
         
         df_clean['PARSED_LOCATIONS'] = df_clean['LOCATIONS'].apply(parse_locations)
-        df_clean['NUM_LOCATIONS'] = df_clean['PARSED_LOCATIONS'].apply(len)
-    
-    # Parse V2TONE field
-    if 'V2TONE' in df_clean.columns:
+
+    # 6. Parse TONE field (Replaces V2TONE)
+    if 'TONE' in df_clean.columns:
         print("  Parsing tone analysis...")
         def parse_tone(tone_str):
             if pd.isna(tone_str):
                 return {}
             parts = str(tone_str).split(',')
-            if len(parts) >= 4:
+            if len(parts) >= 6:
                 return {
-                    'avg_tone': parts[0],
-                    'positive_score': parts[1],
-                    'negative_score': parts[2],
-                    'polarity': parts[3] if len(parts) > 3 else None,
-                    'activity_reference_density': parts[4] if len(parts) > 4 else None,
-                    'self_group_reference_density': parts[5] if len(parts) > 5 else None
+                    'avg_tone': float(parts[0]),
+                    'positive_score': float(parts[1]),
+                    'negative_score': float(parts[2]),
+                    'polarity': float(parts[3]),
+                    'activity_ref_density': float(parts[4]),
+                    'self_group_ref_density': float(parts[5])
                 }
             return {}
         
-        df_clean['PARSED_TONE'] = df_clean['V2TONE'].apply(parse_tone)
-    
+        df_clean['PARSED_TONE'] = df_clean['TONE'].apply(parse_tone)
+
     print(f"✅ Cleaning complete. Original shape: {df.shape}, Cleaned shape: {df_clean.shape}")
     
     return df_clean
 
 def create_es_mapping_for_gkg():
     """Create Elasticsearch mapping for GKG data"""
-    gkg_mapping = {
-        "mappings": {
-            "properties": {
-                "GKGRECORDID": {"type": "keyword"},
-                "DATE": {"type": "date"},
-                "year": {"type": "integer"},
-                "month": {"type": "integer"},
-                "day": {"type": "integer"},
-                "SOURCECOLLECTIONIDENTIFIER": {"type": "keyword"},
-                "SOURCECOMMONNAME": {
-                    "type": "text",
-                    "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}
-                },
-                "DOCUMENTIDENTIFIER": {"type": "keyword"},
-                "DOMAIN": {"type": "keyword"},
-                "NUM_THEMES": {"type": "integer"},
-                "NUM_LOCATIONS": {"type": "integer"},
-                "NUM_COUNTS": {"type": "integer"},
-                "THEMES": {"type": "text"},
-                "PARSED_THEMES": {"type": "text"},
-                "LOCATIONS": {"type": "text"},
-                "PARSED_LOCATIONS": {
-                    "type": "nested",
-                    "properties": {
-                        "type": {"type": "keyword"},
-                        "full_name": {"type": "text"},
-                        "country_code": {"type": "keyword"},
-                        "adm1": {"type": "keyword"},
-                        "lat": {"type": "float"},
-                        "lon": {"type": "float"},
-                        "feature_id": {"type": "keyword"}
-                    }
-                },
-                "COUNTS": {"type": "text"},
-                "PARSED_COUNTS": {
-                    "type": "nested",
-                    "properties": {
-                        "type": {"type": "keyword"},
-                        "count": {"type": "integer"},
-                        "object": {"type": "text"}
-                    }
-                },
-                "PERSONS": {"type": "text"},
-                "ORGANIZATIONS": {"type": "text"},
-                "V2TONE": {"type": "text"},
-                "PARSED_TONE": {
-                    "type": "object",
-                    "properties": {
-                        "avg_tone": {"type": "float"},
-                        "positive_score": {"type": "float"},
-                        "negative_score": {"type": "float"},
-                        "polarity": {"type": "keyword"},
-                        "activity_reference_density": {"type": "float"},
-                        "self_group_reference_density": {"type": "float"}
-                    }
-                },
-                "V2ENHANCEDDATES": {"type": "text"},
-                "V2QUOTATIONS": {"type": "text"},
-                "TIMESTAMP_INGESTED": {"type": "date"}
-            }
-        }
-    }
-    
-    return gkg_mapping
+    return read_json("gkg_mapping.json")
 
 def ingest_gkg_direct(es_client, df, index_name):
     """
@@ -322,8 +232,6 @@ def ingest_gkg_direct(es_client, df, index_name):
     # Convert DataFrame to a list of dictionaries
     # 'records' format preserves the nested structures (lists/dicts) created by your cleaning functions
     docs = df.to_dict('records')
-    
-    from elasticsearch.helpers import bulk
     
     def generate_actions():
         for doc in docs:
@@ -359,7 +267,6 @@ def upload_gkg_to_elasticsearch(user, password, gkg_file_path, index_name="gkg_d
 
 if __name__ == "__main__":
     mappings = read_json("mappings.json")
-    countrycode_dict = read_json("country_code.json")
     load_dotenv()
     user = os.getenv("ESUSER")
     password = os.getenv("ESPASSWORD")

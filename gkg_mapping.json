@@ -1,0 +1,57 @@
+{
+  "mappings": {
+    "properties": {
+      "DATE": { "type": "date" },
+      "year": { "type": "integer" },
+      "month": { "type": "integer" },
+      "day": { "type": "integer" },
+      "NUMARTS": { "type": "integer" },
+      "SOURCEURLS": { "type": "keyword" },
+      "SOURCES": { 
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+      },
+      "DOMAIN": { "type": "keyword" },
+      "THEMES": { "type": "text" },
+      "PARSED_THEMES": { "type": "keyword" },
+      "LOCATIONS": { "type": "text" },
+      "PARSED_LOCATIONS": {
+        "type": "nested",
+        "properties": {
+          "type": { "type": "keyword" },
+          "full_name": { "type": "text" },
+          "country_code": { "type": "keyword" },
+          "adm1": { "type": "keyword" },
+          "lat": { "type": "float" },
+          "lon": { "type": "float" },
+          "feature_id": { "type": "keyword" }
+        }
+      },
+      "COUNTS": { "type": "text" },
+      "PARSED_COUNTS": {
+        "type": "nested",
+        "properties": {
+          "type": { "type": "keyword" },
+          "count": { "type": "integer" },
+          "object": { "type": "text" }
+        }
+      },
+      "PERSONS": { "type": "text" },
+      "ORGANIZATIONS": { "type": "text" },
+      "TONE": { "type": "text" },
+      "PARSED_TONE": {
+        "type": "object",
+        "properties": {
+          "avg_tone": { "type": "float" },
+          "positive_score": { "type": "float" },
+          "negative_score": { "type": "float" },
+          "polarity": { "type": "float" },
+          "activity_ref_density": { "type": "float" },
+          "self_group_ref_density": { "type": "float" }
+        }
+      },
+      "CAMEOEVENTIDS": { "type": "keyword" },
+      "TIMESTAMP_INGESTED": { "type": "date" }
+    }
+  }
+}
