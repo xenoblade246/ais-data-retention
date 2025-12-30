@@ -1,13 +1,11 @@
 import os
 import pandas as pd
-import numpy as np
 from datetime import datetime, timezone
 import json
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
 import time as tm
 from typing import Optional
-import csv
 
 ################################################ Functions ################################################
 def connect_to_es(user, password) -> Elasticsearch:
