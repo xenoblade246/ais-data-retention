@@ -1,16 +1,9 @@
-# ilm_manager.py
-
-# ilm_manager.py
-
 import os
-import sys
 import time as tm
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
-from elasticsearch.exceptions import NotFoundError
 import json
-
 
 def connect_to_es(user, password) -> Elasticsearch:
     """
@@ -28,7 +21,7 @@ def connect_to_es(user, password) -> Elasticsearch:
     )
 
 
-def simple_setup_ilm(user, password, delete_after_days=14):
+def simple_setup_ilm(user, password, mappings, delete_after_days=14):
     """
     Simplified ILM setup that's more reliable.
     """
@@ -38,26 +31,8 @@ def simple_setup_ilm(user, password, delete_after_days=14):
         print("🔄 Setting up simplified ILM...")
         
         # 1. Create ILM policy
-        policy_body = {
-            "policy": {
-                "phases": {
-                    "hot": {
-                        "actions": {
-                            "rollover": {
-                                "max_age": "1d",
-                                "max_primary_shard_size": "50gb"
-                            }
-                        }
-                    },
-                    "delete": {
-                        "min_age": f"{delete_after_days}d",
-                        "actions": {
-                            "delete": {}
-                        }
-                    }
-                }
-            }
-        }
+        with open("C:\\Users\\ngyee\\Coding\\OTB\\ais-data-retention\\country_code.json", "r") as f:
+            policy_body = json.load(f)
         
         try:
             es.ilm.put_lifecycle(name="ais_policy", body=policy_body)
@@ -132,9 +107,7 @@ def setup_ilm_for_all_indices(user, password, delete_after_days=14):
     """
     print("🔄 Starting ILM setup...")
     
-    try:
-        es = connect_to_es(user, password)
-        
+    try:        
         # Use the simplified approach
         return simple_setup_ilm(user, password, delete_after_days)
         
@@ -172,8 +145,8 @@ def check_ilm_status(user, password):
                     print(f"  - {policy_name}")
             else:
                 print("\n📋 No ILM policies found")
-        except:
-            print("\n📋 Could not retrieve ILM policies")
+        except Exception as e:
+            print(f"\n📋 Could not retrieve ILM policies: {e}")
         
         # Check indices
         print("\n📊 Index Status:")
@@ -190,16 +163,16 @@ def check_ilm_status(user, password):
             print(f"\n  Index: {index_name}")
             
             if ilm_settings:
-                print(f"    ILM Policy: {ilm_settings.get('name', 'Not set')}")
-                print(f"    Rollover Alias: {ilm_settings.get('rollover_alias', 'Not set')}")
+                print(f"\tILM Policy: {ilm_settings.get('name', 'Not set')}")
+                print(f"\tRollover Alias: {ilm_settings.get('rollover_alias', 'Not set')}")
                 
                 # Get document count
                 try:
                     stats = es.indices.stats(index=index_name)
                     docs = stats["indices"][index_name]["primaries"]["docs"]["count"]
-                    print(f"    Document Count: {docs:,}")
-                except:
-                    print(f"    Document Count: Unknown")
+                    print(f"\tDocument Count: {docs:,}")
+                except Exception as e:
+                    print(f"\tDocument Count: Unknown\n\tError: {e}")
                     
                 # Check for old data
                 try:
@@ -217,11 +190,11 @@ def check_ilm_status(user, password):
                     
                     count_response = es.count(index=index_name, body=count_query)
                     old_count = count_response.get("count", 0)
-                    print(f"    Documents older than 14 days: {old_count:,}")
-                except:
-                    print(f"    Old document count: Could not check")
+                    print(f"\tDocuments older than 14 days: {old_count:,}")
+                except Exception as e:
+                    print(f"\tOld document count: Could not check\n\tError: {e}")
             else:
-                print(f"    ILM: Not configured")
+                print("\tILM: Not configured")
         
         print("\n" + "=" * 60)
         
@@ -297,12 +270,9 @@ def create_daily_cleanup_task(user, password):
     deleted_count = manual_delete_old_data(user, password, days_old=14)
     
     # 2. Force ILM to run if needed
-    try:
-        es = connect_to_es(user, password)
-        es.ilm.retry_policy(index="wstream_s*") #type: ignore
-        print("✅ Triggered ILM policy retry")
-    except:
-        pass
+    es = connect_to_es(user, password)
+    es.ilm.retry_policy(index="wstream_s*") #type: ignore
+    print("✅ Triggered ILM policy retry")
     
     # 3. Check ILM status
     check_ilm_status(user, password)
@@ -324,8 +294,8 @@ def epoch_to_estime(epoch: int) -> str:
     epoch -= 8 * 3600
     return tm.strftime("%Y-%m-%dT%H:%M:%S.000Z", tm.localtime(epoch))
 
-def create_index_template(es, template_name="ais_data_template", index_pattern="wstream_s*", 
-                          policy_name="ais_data_policy", mappings: dict):
+def create_index_template(es, mappings, template_name="ais_data_template", index_pattern="wstream_s*", 
+                          policy_name="ais_data_policy"):
     """
     Create an index template that applies the ILM policy to matching indices.
     
@@ -400,7 +370,7 @@ def create_ilm_policy(es: Elasticsearch, policy_name="ais_data_policy", delete_a
         print(f"❌ Error creating ILM policy: {e}")
         return None
 
-def setup_environment():
+def setup_environment() -> tuple[str, str]:
     """Load environment variables"""
     load_dotenv()
     
@@ -412,21 +382,17 @@ def setup_environment():
         print("Please create a .env file with:")
         print("ESUSER=your_username")
         print("ESPASSWORD=your_password")
-        return None, None
+        raise Exception("User or password not initialized in .env file")
     
     print(f"✅ Loaded credentials for user: {user}")
     return user, password
 
-def main_menu():
+def main_menu(user: str, password: str):
     """Main menu for ILM management"""
     print("\n" + "="*60)
     print("ELASTICSEARCH ILM MANAGER")
     print("Automatically delete data older than 2 weeks")
     print("="*60)
-    
-    user, password = setup_environment()
-    if not user or not password:
-        return
     
     while True:
         print("\n" + "="*60)
@@ -480,50 +446,6 @@ def main_menu():
         
         input("\nPress Enter to continue...")
 
-def schedule_daily_cleanup():
-    """
-    Create a scheduled task for daily cleanup.
-    This can be added to cron (Linux) or Task Scheduler (Windows).
-    """
-    user, password = setup_environment()
-    if not user or not password:
-        return
-    
-    print(f"\n📅 Scheduling daily cleanup at {datetime.now()}")
-    print("This function should be scheduled to run daily.")
-    print("\nFor Linux (cron):")
-    print("0 2 * * * /usr/bin/python3 /path/to/ilm_manager.py --daily-cleanup")
-    print("\nFor Windows (Task Scheduler):")
-    print("Create a daily task at 2 AM running:")
-    print('python "C:\\path\\to\\ilm_manager.py" --daily-cleanup')
-    
-    # Run the cleanup
-    create_daily_cleanup_task(user, password)
-
 if __name__ == "__main__":
-    # Command line arguments
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--daily-cleanup":
-            schedule_daily_cleanup()
-        elif sys.argv[1] == "--setup":
-            user, password = setup_environment()
-            if user and password:
-                setup_ilm_for_all_indices(user, password, 14)
-        elif sys.argv[1] == "--check":
-            user, password = setup_environment()
-            if user and password:
-                check_ilm_status(user, password)
-        elif sys.argv[1] == "--manual-cleanup":
-            user, password = setup_environment()
-            if user and password:
-                manual_delete_old_data(user, password, 14)
-        else:
-            print("Usage:")
-            print("  python ilm_manager.py                     # Interactive menu")
-            print("  python ilm_manager.py --daily-cleanup     # Run daily cleanup")
-            print("  python ilm_manager.py --setup             # Setup ILM policy")
-            print("  python ilm_manager.py --check             # Check ILM status")
-            print("  python ilm_manager.py --manual-cleanup    # Manual cleanup")
-    else:
-        # Interactive mode
-        main_menu()
+    user, password = setup_environment()
+    main_menu(user, password)

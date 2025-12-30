@@ -1,11 +1,10 @@
 import os
 import pandas as pd
-from datetime import datetime, timezone
 import json
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
 import time as tm
-from typing import Optional
+from urllib.parse import urlparse
 
 ################################################ Functions ################################################
 def connect_to_es(user, password) -> Elasticsearch:
@@ -61,91 +60,6 @@ def read_json(name: str) -> dict:
     with open(name, "r") as f:
         out = json.load(f)
     return out
-
-def ingestpastdata(user: Optional[str], password: Optional[str], indexname: str, mappings: dict, file: str):
-    """
-    Ingests data from a CSV file into an Elasticsearch index.
-
-    This function performs an ETL (Extract, Transform, Load) process:
-    1. Connects to the Elasticsearch instance.
-    2. Creates the specified index with provided mappings if it doesn't exist.
-    3. Processes the CSV file to ensure specific column ordering and handles missing values.
-    4. Transforms Unix epoch timestamps into ISO 8601 UTC strings.
-    5. Formats latitude and longitude into a 'Location' list for geo-spatial indexing.
-    6. Loads the data row-by-row into the database.
-
-    Args:
-        user (Optional[str]): Username for Elasticsearch authentication.
-        password (Optional[str]): Password for Elasticsearch authentication.
-        indexname (str): The name of the target index in Elasticsearch.
-        mappings (dict): A dictionary defining the Elasticsearch index settings and schema.
-        countrycodeDict (dict): A dictionary used to look up country names via MMSI prefixes.
-        file (str): The file path to the source CSV data.
-
-    Raises:
-        Exception: If a connection error occurs or if document indexing fails.
-    """
-    try:
-        # Connect to Elastic Search DB
-        es = connect_to_es(user, password)
-        es.indices.create(index=indexname, body=mappings, ignore=400) #type: ignore
-        df = pd.read_csv(file)
-        # Define the expected columns in sequence
-        expectedCol = [
-            "Country",
-            "MMSI",
-            "Lat",
-            "Lon",
-            "Name",
-            "Time",
-            "Source",
-            "Subsource",
-            "Speed",
-            "Course",
-        ]
-        # Rearrange the dataframe
-        df = df[expectedCol].copy()
-
-        # Convert epoch time in 'Time' column to ISO format
-        def convert_epoch_to_iso(epoch_time):
-            try:
-                if isinstance(epoch_time, (int, float)):
-                    dt_object = datetime.fromtimestamp(epoch_time, tz=timezone.utc)
-                elif isinstance(epoch_time, str) and epoch_time.isdigit():
-                    dt_object = datetime.fromtimestamp(int(epoch_time), tz=timezone.utc)
-                else:
-                    return ""
-                return dt_object.isoformat(timespec='microseconds').replace('+00:00', 'Z')
-            except (ValueError, TypeError):
-                return ""
-
-        df['Time'] = df['Time'].apply(convert_epoch_to_iso)
-
-        # Account for missing values
-        df = df.fillna("")
-        df_dict = df.to_dict("records")
-
-        # Iterate through each row of the dictionary
-        for i in range(len(df_dict)):
-            report = {}
-            location = [str(df_dict[i]["Lat"]) + "," + str(df_dict[i]["Lon"])]
-
-            # Assign Key value pairs
-            for key in expectedCol:
-                report[key] = df_dict[i][key]
-            report["Location"] = location
-            doc = json.dumps(report)
-
-            # Feeds into Elasticsearch
-            try:
-                es.index(index=indexname, body=doc) #type: ignore
-            except Exception as e:
-                raise Exception(e)
-
-        print("Success", "Data ingestion completed successfully.")
-
-    except Exception as e:
-        print("Error", f"An unexpected error occurred: {str(e)}")
 
 def parse_gkg_columns():
     """Return the column definitions for GKG 2.0 format"""
@@ -245,16 +159,11 @@ def clean_gkg_data(df):
     if 'DOCUMENTIDENTIFIER' in df_clean.columns:
         print("  Extracting domains...")
         def extract_domain(url):
-            try:
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                domain = parsed.netloc
-                # Remove www. prefix
-                if domain.startswith('www.'):
-                    domain = domain[4:]
-                return domain
-            except:
-                return None
+            parsed = urlparse(url)
+            domain = parsed.netloc
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            return domain
         
         df_clean['DOMAIN'] = df_clean['DOCUMENTIDENTIFIER'].apply(extract_domain)
     
@@ -406,140 +315,47 @@ def create_es_mapping_for_gkg():
     
     return gkg_mapping
 
-def convert_to_csv_for_es(df, output_csv_path):
+def ingest_gkg_direct(es_client, df, index_name):
     """
-    Convert GKG DataFrame to CSV format compatible with Elasticsearch ingestion
-    
-    Args:
-        df: GKG DataFrame
-        output_csv_path: Path to save CSV file
+    Ingests a cleaned GKG DataFrame directly into ES without an intermediate CSV.
     """
-    print(f"💾 Converting to CSV: {output_csv_path}")
+    # Convert DataFrame to a list of dictionaries
+    # 'records' format preserves the nested structures (lists/dicts) created by your cleaning functions
+    docs = df.to_dict('records')
     
-    # Select and rename columns for Elasticsearch compatibility
-    es_df = pd.DataFrame()
+    from elasticsearch.helpers import bulk
     
-    # Map GKG columns to AIS-like structure where possible
-    if 'PARSED_LOCATIONS' in df.columns:
-        # Extract first location for geo mapping
-        def get_first_location(locations):
-            if locations and len(locations) > 0:
-                return locations[0]
-            return None
-        
-        first_locs = df['PARSED_LOCATIONS'].apply(get_first_location)
-        
-        es_df['Country'] = first_locs.apply(lambda x: x.get('full_name') if x else '')
-        es_df['Lat'] = first_locs.apply(lambda x: float(x.get('lat')) if x and x.get('lat') else None)
-        es_df['Lon'] = first_locs.apply(lambda x: float(x.get('lon')) if x and x.get('lon') else None)
-    
-    # Add GKG metadata
-    es_df['MMSI'] = df['GKGRECORDID']  # Using GKGRECORDID as identifier
-    es_df['Name'] = df['SOURCECOMMONNAME'].fillna('Unknown Source')
-    es_df['Time'] = df['DATE'].apply(lambda x: x.isoformat() if pd.notna(x) else '')
-    
-    # Source information
-    es_df['Source'] = 'GKG'
-    es_df['Subsource'] = df['SOURCECOLLECTIONIDENTIFIER'].apply(
-        lambda x: {
-            '1': 'Web',
-            '2': 'Citation',
-            '3': 'Core',
-            '4': 'DTIC',
-            '5': 'JSTOR',
-            '6': 'USGS'
-        }.get(str(x), 'Unknown')
-    )
-    
-    # Additional GKG metadata
-    es_df['Speed'] = df['NUM_THEMES'].fillna(0)  # Using number of themes as "speed"
-    es_df['Course'] = df['PARSED_TONE'].apply(
-        lambda x: x.get('avg_tone', '0') if isinstance(x, dict) else '0'
-    )
-    
-    # Add raw GKG fields for reference
-    es_df['GKG_THEMES'] = df['THEMES'].fillna('')
-    es_df['GKG_LOCATIONS'] = df['LOCATIONS'].fillna('')
-    es_df['GKG_ORGANIZATIONS'] = df['ORGANIZATIONS'].fillna('')
-    es_df['GKG_PERSONS'] = df['PERSONS'].fillna('')
-    es_df['GKG_TONE_AVG'] = df['PARSED_TONE'].apply(
-        lambda x: x.get('avg_tone', '') if isinstance(x, dict) else ''
-    )
-    
-    # Save to CSV
-    es_df.to_csv(output_csv_path, index=False)
-    print(f"✅ CSV saved with {len(es_df)} rows, {len(es_df.columns)} columns")
-    
-    return output_csv_path
+    def generate_actions():
+        for doc in docs:
+            # Handle the Time field safely
+            if isinstance(doc.get('DATE'), pd.Timestamp):
+                doc['Time'] = doc['DATE'].isoformat() + "Z"
+            
+            # Create a simple location field for map visualization if needed
+            if 'PARSED_LOCATIONS' in doc and doc['PARSED_LOCATIONS']:
+                first_loc = doc['PARSED_LOCATIONS'][0]
+                doc['Location'] = f"{first_loc['lat']},{first_loc['lon']}"
+            
+            yield {
+                "_index": index_name,
+                "_source": doc
+            }
 
-def upload_gkg_to_elasticsearch(user, password, gkg_file_path, index_name="gkg_data", 
-                                sample_size=None, clean_data=True):
-    """
-    Main function to upload GKG file to Elasticsearch
+    success, failed = bulk(es_client, generate_actions())
+    print(f"✅ Successfully indexed {success} documents. Failed: {failed}")
+
+def upload_gkg_to_elasticsearch(user, password, gkg_file_path, index_name="gkg_data"):
+    df_raw = gkg_to_dataframe(gkg_file_path)
+    df_cleaned = clean_gkg_data(df_raw) # This function is great, keep it!
     
-    Args:
-        user: Elasticsearch username
-        password: Elasticsearch password
-        gkg_file_path: Path to GKG file
-        index_name: Elasticsearch index name
-        sample_size: Number of rows to sample (for testing)
-        clean_data: Whether to clean data before upload
-    """
-    print("\n🚀 Starting GKG upload process")
-    print(f"   File: {gkg_file_path}")
-    print(f"   Index: {index_name}")
+    es = connect_to_es(user, password)
     
-    # Step 1: Load GKG data
-    df_raw = gkg_to_dataframe(gkg_file_path, sample_size) # type: ignore
-    if df_raw is None:
-        return False
+    # Use the rich GKG mapping you already wrote
+    gkg_mapping = create_es_mapping_for_gkg()
+    es.indices.create(index=index_name, body=gkg_mapping, ignore=400) # type: ignore
     
-    # Step 2: Clean data (optional)
-    if clean_data:
-        df = clean_gkg_data(df_raw)
-    else:
-        df = df_raw
-    
-    # Step 3: Create temporary CSV
-    temp_csv = f"temp_gkg_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    csv_path = convert_to_csv_for_es(df, temp_csv)
-    
-    # Step 4: Connect to Elasticsearch
-    print("\n🔗 Connecting to Elasticsearch...")
-    try:
-        es = connect_to_es(user, password)
-        
-        # Create index with GKG-specific mapping
-        gkg_mapping = create_es_mapping_for_gkg()
-        es.indices.create(index=index_name, body=gkg_mapping, ignore=400) # type: ignore
-        print(f"✅ Created/verified index: {index_name}")
-        
-        # Step 5: Upload using existing ingest function
-        print("\n📤 Uploading to Elasticsearch...")
-        ingestpastdata(
-            user=user,
-            password=password,
-            indexname=index_name,
-            mappings=gkg_mapping,
-            file=csv_path
-        )
-        
-        # Step 6: Verify upload
-        print("\n✅ Upload complete! Verifying...")
-        result = es.count(index=index_name)
-        print(f"   Documents in index: {result['count']:,}")
-        
-        # Step 7: Clean up temporary file
-        os.remove(csv_path)
-        print(f"   Cleaned up temporary file: {csv_path}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error during upload: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    # Step 5: Direct Ingest (No intermediate CSV!)
+    ingest_gkg_direct(es, df_cleaned, index_name)
 
 if __name__ == "__main__":
     mappings = read_json("mappings.json")
