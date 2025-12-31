@@ -65,7 +65,7 @@ def read_json(name: str) -> dict:
         out = json.load(f)
     return out
 
-def gkg_to_dataframe(gkg_file_path, sample_size=1000):
+def gkg_to_dataframe(gkg_file_path, start_row, end_row):
     """
     Convert GKG file to pandas DataFrame
     
@@ -77,30 +77,24 @@ def gkg_to_dataframe(gkg_file_path, sample_size=1000):
         pandas.DataFrame: Converted DataFrame
     """
     print(f"📖 Reading GKG file: {gkg_file_path}")
-    
-    columns = GKG_COLUMNS
-    
-    # Read the GKG file
-    try:
-        # GKG files are tab-separated
-        if sample_size:
-            df = pd.read_csv(gkg_file_path, sep='\t', nrows=sample_size, 
-                            header=None, names=columns, low_memory=False)
-            print(f"📊 Sampled {sample_size} rows for preview")
-        else:
-            df = pd.read_csv(gkg_file_path, sep='\t', 
-                            header=None, names=columns, low_memory=False)
         
-        print(f"✅ Successfully loaded {len(df)} rows, {len(df.columns)} columns")
-        print("\nColumn overview:")
-        for i, col in enumerate(df.columns):
-            print(f"  {i+1:2d}. {col}")
-        
-        return df
+    # GKG files are tab-separated
+    rows_to_read = end_row - start_row
+
+    df = pd.read_csv(
+        gkg_file_path, 
+        sep='\t', 
+        header=0,
+        skiprows=range(1, start_row),
+        nrows=rows_to_read, 
+    )
     
-    except Exception as e:
-        print(f"❌ Error reading GKG file: {e}")
-        return None
+    print(f"✅ Successfully loaded {len(df)} rows, {len(df.columns)} columns.")
+    print("\nColumn overview:")
+    for i, col in enumerate(df.columns):
+        print(f"  {i+1:2d}. {col}")
+    
+    return df
 
 def clean_gkg_data(df):
     """
@@ -226,24 +220,36 @@ def create_es_mapping_for_gkg():
     return read_json("gkg_mapping.json")
 
 def ingest_gkg_direct(es_client, df, index_name):
-    """
-    Ingests a cleaned GKG DataFrame directly into ES without an intermediate CSV.
-    """
-    # Convert DataFrame to a list of dictionaries
-    # 'records' format preserves the nested structures (lists/dicts) created by your cleaning functions
-    docs = df.to_dict('records')
+    # 1. Convert NaT/NaN to None so they become null in JSON
+    df_ingest = df.replace({pd.NA: None, pd.NaT: None})
+    df_ingest = df_ingest.where(pd.notnull(df_ingest), None)
+    
+    docs = df_ingest.to_dict('records')
     
     def generate_actions():
         for doc in docs:
-            # Handle the Time field safely
-            if isinstance(doc.get('DATE'), pd.Timestamp):
-                doc['Time'] = doc['DATE'].isoformat() + "Z"
+            # Handle the DATE field: Convert valid Timestamps to ISO strings
+            if doc.get('DATE') is not None:
+                # If it's still a Timestamp object after the clean-up above
+                if hasattr(doc['DATE'], 'isoformat'):
+                    doc['Time'] = doc['DATE'].isoformat() + "Z"
+                else:
+                    doc['Time'] = str(doc['DATE'])
             
-            # Create a simple location field for map visualization if needed
+            # Location geo_point handling
             if 'PARSED_LOCATIONS' in doc and doc['PARSED_LOCATIONS']:
                 first_loc = doc['PARSED_LOCATIONS'][0]
-                doc['Location'] = f"{first_loc['lat']},{first_loc['lon']}"
+                # Ensure lat/lon are not None before formatting
+                if first_loc.get('lat') is not None and first_loc.get('lon') is not None:
+                    doc['Location'] = {
+                        "lat": float(first_loc['lat']),
+                        "lon": float(first_loc['lon'])
+                    }
             
+            # Clean up the original DATE object which might not be serializable
+            if 'DATE' in doc:
+                del doc['DATE']
+
             yield {
                 "_index": index_name,
                 "_source": doc
@@ -252,8 +258,8 @@ def ingest_gkg_direct(es_client, df, index_name):
     success, failed = bulk(es_client, generate_actions())
     print(f"✅ Successfully indexed {success} documents. Failed: {failed}")
 
-def upload_gkg_to_elasticsearch(user, password, gkg_file_path, index_name="gkg_data"):
-    df_raw = gkg_to_dataframe(gkg_file_path)
+def upload_gkg_to_elasticsearch(user, password, gkg_file_path, start_row, end_row, index_name="gkg_data"):
+    df_raw = gkg_to_dataframe(gkg_file_path, start_row, end_row)
     df_cleaned = clean_gkg_data(df_raw) # This function is great, keep it!
     
     es = connect_to_es(user, password)
@@ -266,13 +272,19 @@ def upload_gkg_to_elasticsearch(user, password, gkg_file_path, index_name="gkg_d
     ingest_gkg_direct(es, df_cleaned, index_name)
 
 if __name__ == "__main__":
-    mappings = read_json("mappings.json")
     load_dotenv()
     user = os.getenv("ESUSER")
     password = os.getenv("ESPASSWORD")
-    upload_gkg_to_elasticsearch(
-        user=user,
-        password=password,
-        gkg_file_path="C:\\Users\\ngyee\\Coding\\OTB\\AIS Data Retention\\20251110.gkg.csv",
-        index_name="gkg_data"
-    )
+    while True:
+        start_row, end_row = tuple(input("Please enter start & end rows, separated by a space: ").split(" "))
+        upload_gkg_to_elasticsearch(
+            user=user,
+            password=password,
+            gkg_file_path="20251110.gkg.csv",
+            start_row = int(start_row),
+            end_row = int(end_row),
+            index_name="gkg_data"
+        )
+
+        if input("Create another data set? Y/N: ") == "N":
+            break
