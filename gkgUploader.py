@@ -220,43 +220,38 @@ def create_es_mapping_for_gkg():
     return read_json("gkg_mapping.json")
 
 def ingest_gkg_direct(es_client, df, index_name):
-    # 1. Convert NaT/NaN to None so they become null in JSON
-    df_ingest = df.replace({pd.NA: None, pd.NaT: None})
-    df_ingest = df_ingest.where(pd.notnull(df_ingest), None)
-    
+    # Convert NaT/NaN to None (JSON null)
+    df_ingest = df.where(pd.notnull(df), None)
     docs = df_ingest.to_dict('records')
     
     def generate_actions():
         for doc in docs:
-            # Handle the DATE field: Convert valid Timestamps to ISO strings
-            if doc.get('DATE') is not None:
-                # If it's still a Timestamp object after the clean-up above
-                if hasattr(doc['DATE'], 'isoformat'):
-                    doc['Time'] = doc['DATE'].isoformat() + "Z"
-                else:
-                    doc['Time'] = str(doc['DATE'])
-            
-            # Location geo_point handling
-            if 'PARSED_LOCATIONS' in doc and doc['PARSED_LOCATIONS']:
-                first_loc = doc['PARSED_LOCATIONS'][0]
-                # Ensure lat/lon are not None before formatting
-                if first_loc.get('lat') is not None and first_loc.get('lon') is not None:
-                    doc['Location'] = {
-                        "lat": float(first_loc['lat']),
-                        "lon": float(first_loc['lon'])
-                    }
-            
-            # Clean up the original DATE object which might not be serializable
-            if 'DATE' in doc:
-                del doc['DATE']
+            # 1. DATE: Convert Timestamp to ISO string for ES
+            if doc.get('DATE') and hasattr(doc['DATE'], 'isoformat'):
+                doc['DATE'] = doc['DATE'].isoformat()
+            else:
+                doc['DATE'] = None
+
+            # 2. FIX: Don't create a 'Location' field. 
+            # Use 'PARSED_LOCATIONS' which is already in your mapping.
+            # Ensure it is a list (for nested type)
+            if not isinstance(doc.get('PARSED_LOCATIONS'), list):
+                doc['PARSED_LOCATIONS'] = []
+
+            # 3. Handle PARSED_COUNTS (ensure it's a list for nested)
+            if not isinstance(doc.get('PARSED_COUNTS'), list):
+                doc['PARSED_COUNTS'] = []
 
             yield {
                 "_index": index_name,
                 "_source": doc
             }
 
-    success, failed = bulk(es_client, generate_actions())
-    print(f"✅ Successfully indexed {success} documents. Failed: {failed}")
+    try:
+        success, failed = bulk(es_client, generate_actions())
+        print(f"✅ Successfully indexed {success} documents. Failed: {failed}")
+    except Exception as e:
+        print(f"❌ Bulk indexing failed: {e}")
 
 def upload_gkg_to_elasticsearch(user, password, gkg_file_path, start_row, end_row, index_name="gkg_data"):
     df_raw = gkg_to_dataframe(gkg_file_path, start_row, end_row)
