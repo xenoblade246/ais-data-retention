@@ -11,3 +11,29 @@
 ## Start-up
 - Make sure Docker containers for Elastic-Kibana are running.
 - Initialize a virtual env in the root directory, or install packages in the `requirements.txt` file.
+
+Run the below block of code in Kibana dev tools before running the Python file:
+```
+PUT _index_template/gkg_data_template
+{
+  "index_patterns": ["gkg_data-*"],
+  "template": {
+    "settings": {
+      "index.lifecycle.name": "ais_policy", 
+      "index.lifecycle.rollover_alias": "gkg_data",
+      "number_of_shards": 1,
+      "number_of_replicas": 1
+    },
+    "mappings": {
+      "properties": {
+        "DATE": { "type": "date" },
+        "PARSED_LOCATIONS": { "type": "nested" },
+        "PARSED_COUNTS": { "type": "nested" },
+        "PARSED_TONE": { "type": "object" }
+        // ... (Include the rest of your properties from gkg_mapping.json here)
+      }
+    }
+  },
+  "priority": 200
+}
+```

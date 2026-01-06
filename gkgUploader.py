@@ -253,33 +253,54 @@ def ingest_gkg_direct(es_client, df, index_name):
     except Exception as e:
         print(f"❌ Bulk indexing failed: {e}")
 
-def upload_gkg_to_elasticsearch(user, password, gkg_file_path, start_row, end_row, index_name="gkg_data"):
+def upload_gkg_to_elasticsearch(user, password, gkg_file_path, start_row, end_row, alias_name="gkg_data"):
     df_raw = gkg_to_dataframe(gkg_file_path, start_row, end_row)
-    df_cleaned = clean_gkg_data(df_raw) # This function is great, keep it!
+    df_cleaned = clean_gkg_data(df_raw)
     
     es = connect_to_es(user, password)
-    
-    # Use the rich GKG mapping you already wrote
     gkg_mapping = create_es_mapping_for_gkg()
-    es.indices.create(index=index_name, body=gkg_mapping, ignore=400) # type: ignore
     
-    # Step 5: Direct Ingest (No intermediate CSV!)
-    ingest_gkg_direct(es, df_cleaned, index_name)
+    if not es.indices.exists_alias(name=alias_name):
+        print(f"🚀 Initializing {alias_name} with ILM bootstrap index...")
+        first_index = f"{alias_name}-000001"
+        gkg_mapping["settings"] = {
+            "index.lifecycle.name": "ais_policy",
+            "index.lifecycle.rollover_alias": alias_name
+        }
+        es.indices.create(index=first_index, body=gkg_mapping)
+        es.indices.update_aliases(body={
+            "actions": [
+                {"add": {"index": first_index, "alias": alias_name, "is_write_index": True}}
+            ]
+        })
+    
+    # Ingest data using the alias name
+    ingest_gkg_direct(es, df_cleaned, alias_name)
+    print(f"🔄 Forcing rollover for alias: {alias_name}")
+    es.indices.rollover(alias=alias_name)
 
 if __name__ == "__main__":
     load_dotenv()
     user = os.getenv("ESUSER")
     password = os.getenv("ESPASSWORD")
-    while True:
-        start_row, end_row = tuple(input("Please enter start & end rows, separated by a space: ").split(" "))
+    start_row = 1
+    end_row = 100
+
+    print("\n\nStarting staggered ingestion...\n\n")
+    for i in range(5):
         upload_gkg_to_elasticsearch(
             user=user,
             password=password,
             gkg_file_path="20251110.gkg.csv",
-            start_row = int(start_row),
-            end_row = int(end_row),
-            index_name="gkg_data"
+            start_row = start_row,
+            end_row = end_row
         )
 
-        if input("Create another data set? Y/N: ") == "N":
-            break
+        print(f"\n\nFinished ingesting rows {start_row}-{end_row}. Sleeping for 61s. {4 - i} ingestions remaining.\n\n")
+        start_row += 100
+        end_row += 100
+
+        if i != 4:
+            tm.sleep(61)
+        else:
+            print("END OF CODE")
